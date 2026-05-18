@@ -8,6 +8,8 @@ use crate::variables::DomainId;
 use crate::variables::IntegerVariable;
 use crate::variables::Literal;
 
+// added functionality here for extra logic regarding domain handling of variables
+
 /// Provides access to domain information to propagators.
 ///
 /// Implements [`ReadDomains`] to expose information about the current variable domains such as the
