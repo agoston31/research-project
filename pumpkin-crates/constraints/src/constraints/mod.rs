@@ -40,7 +40,7 @@ mod table;
 pub use all_different::*;
 pub use arithmetic::*;
 pub use boolean::*;
-pub use circuit
+pub use circuit::*;
 pub use clause::*;
 pub use cumulative::*;
 pub use disjunctive_strict::*;
