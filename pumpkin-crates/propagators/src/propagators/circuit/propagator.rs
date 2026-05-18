@@ -33,7 +33,8 @@ pub struct CircuitConstructor<Var> {
 pub struct CircuitPropagator<Var> {
     pub successors: Box<[Var]>,
     // fields (and maybe extra ones)
-    inference_code: InferenceCode,
+    prevent_inference_code: InferenceCode,
+    articulation_inference_code: InferenceCode,
 }
 
 // The whole propagator constructor itself
@@ -49,7 +50,7 @@ where
         self,
         mut context: pumpkin_core::propagation::PropagatorConstructorContext,
     ) -> Self::PropagatorImpl {
-        // registering for domain events; when should our propagator be enqueued. The flag DomainEvents: ASSIGN determines that it should be queued on 'assignment'. 
+        // registering for domain events; when should our propagator be enqueued. The flag DomainEvents: REMOVE determines that it should be queued on 'removal' of any value of the domain. 
         // LocalId is to internally indicate to what variable changes occur; unique for each var
         self.successors
             .iter()
@@ -57,12 +58,12 @@ where
             .for_each(|(index, successor)| {
                 context.register(
                     successor.clone(),
-                    DomainEvents::ASSIGN,
+                    DomainEvents::ANY_INT,
                     LocalId::from(index as u32),
                 );
                 context.register_backtrack(
                     successor.clone(),
-                    DomainEvents::ASSIGN,
+                    DomainEvents::ANY_INT,
                     LocalId::from(index as u32),
                 );
             });
@@ -71,7 +72,8 @@ where
         CircuitPropagator {
             // set variables to base values
             successors: self.successors,
-            inference_code: InferenceCode::new(self.constraint_tag, CircuitPrevent),
+            prevent_inference_code: InferenceCode::new(self.constraint_tag, CircuitPrevent),
+            articulation_inference_code: InferenceCode::new(self.constraint_tag, CircuitArticulation),
         }
     }
     
@@ -87,9 +89,10 @@ where
 }
 
 declare_inference_label!(CircuitPrevent);
+declare_inference_label!(CircuitArticulation);
 
 
-// here comes an implementation of Propagator which has some basic functions (like defining the name) but also important functions propagate() and propagate_from_scratch()
+// Implementation of Propagator which has some basic functions (like defining the name) but also important functions propagate() and propagate_from_scratch()
 impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
     fn name(&self) -> &str {
     "Circuit"
@@ -98,9 +101,9 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
     fn propagate_from_scratch(&self, mut context: PropagationContext) -> PropagationStatusCP {
         self.remove_self_loops(&mut context)?;
         self.check(context.domains())?;
-        self.prevent(context)
+        self.prevent(&mut context)?;
+        self.articulation_prune(&mut context)
     }
-    // defining name, but also priority (?), notify (?), notify__backtrack (?), propagate (when is this called), propagate_from_scratch (and when this? and why was this not implemented in reference)
 }
 
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
@@ -109,7 +112,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             context.post(
                 predicate!(domain_of_one_indexed_node != index_to_domain_value(zero_indexed_node)),
                 conjunction!(),
-                &self.inference_code,
+                &self.prevent_inference_code,
             )?;
         }
         Ok(())
@@ -117,7 +120,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
 }
 
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
-    fn prevent(&self, mut context: PropagationContext) -> PropagationStatusCP {
+    fn prevent(&self, context: &mut PropagationContext) -> PropagationStatusCP {
         // collect all nodes that have an incoming enforced/fixed edge, these cannot be start of possible chains
         let mut has_incoming_edge = FixedBitSet::with_capacity(self.successors.len());
         // for every fixed edge we find, we follow it and add the resulting node to the list
@@ -157,11 +160,15 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
                 context.post(
                     predicate!(self.successors[next] != index_to_domain_value(unmarked)),
                     reason,
-                    &self.inference_code,
+                    &self.prevent_inference_code,
                 )?;
             }
         }
 
+        Ok(())
+    }
+
+    fn articulation_prune(&self, _context: &mut PropagationContext) -> PropagationStatusCP {
         Ok(())
     }
 
@@ -215,7 +222,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
                     // Otherwise, we raise a conflict
                     return Err(Conflict::Propagator(PropagatorConflict {
                         conjunction: self.create_check_explanation(context, &cycle_path),
-                        inference_code: self.inference_code.clone(),
+                        inference_code: self.prevent_inference_code.clone(),
                     }));
                 }
 
