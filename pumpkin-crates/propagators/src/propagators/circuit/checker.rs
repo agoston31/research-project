@@ -2,9 +2,15 @@ use fixedbitset::FixedBitSet;
 use pumpkin_checking::AtomicConstraint;
 use pumpkin_checking::CheckerVariable;
 use pumpkin_checking::InferenceChecker;
+use pumpkin_checking::VariableState;
 
 #[derive(Debug, Clone)]
 pub struct CircuitChecker<Var> {
+    pub successors: Box<[Var]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CircuitArticulationChecker<Var> {
     pub successors: Box<[Var]>,
 }
 
@@ -15,7 +21,7 @@ where
 {
     fn check(
         &self,
-        state: pumpkin_checking::VariableState<Atomic>,
+        state: VariableState<Atomic>,
         _premises: &[Atomic],
         _consequent: Option<&Atomic>,
     ) -> bool {
@@ -55,6 +61,131 @@ where
     }
 }
 
+impl<Var, Atomic> InferenceChecker<Atomic> for CircuitArticulationChecker<Var>
+where
+    Var: CheckerVariable<Atomic> + 'static,
+    Atomic: AtomicConstraint,
+{
+    fn check(
+        &self,
+        state: VariableState<Atomic>,
+        _premises: &[Atomic],
+        _consequent: Option<&Atomic>,
+    ) -> bool {
+        let n = self.successors.len();
+
+        let mut graph = vec![Vec::new(); n];
+
+        for from in 0..n {
+            for value in 1..=n as i32 {
+                if self.successors[from].induced_domain_contains(&state, value) {
+                    let to = domain_value_to_index(value);
+
+                    if to < n && from != to {
+                        graph[from].push(to);
+                        graph[to].push(from);
+                    }
+                }
+            }
+        }
+
+        for neighbours in graph.iter_mut() {
+            neighbours.sort_unstable();
+            neighbours.dedup();
+        }
+
+        // if let Some(consequent) = consequent {
+        //     // For a pruning x != v, the checker receives the state induced by
+        //     // the premises only. To verify the pruning, we need to test whether
+        //     // assuming the opposite x = v makes the graph impossible.
+        //     //
+        //     // Easiest first version: rely on the propagated explanation being
+        //     // full-domain and check only conflict-style articulation.
+        //     //
+        //     // We will improve this once we know how to extract variable/value
+        //     // from the consequent.
+        // }
+
+        has_articulation_point_or_is_disconnected(&graph)
+    }
+}
+
+fn has_articulation_point_or_is_disconnected(graph: &[Vec<usize>]) -> bool {
+    let n = graph.len();
+
+    if n <= 2 {
+        return false;
+    }
+
+    let mut visited = vec![false; n];
+    let mut discovery = vec![0usize; n];
+    let mut low = vec![0usize; n];
+    let mut parent = vec![None; n];
+    let mut time = 0usize;
+
+    fn dfs(
+        u: usize,
+        graph: &[Vec<usize>],
+        visited: &mut [bool],
+        discovery: &mut [usize],
+        low: &mut [usize],
+        parent: &mut [Option<usize>],
+        time: &mut usize,
+    ) -> bool {
+        visited[u] = true;
+        *time += 1;
+        discovery[u] = *time;
+        low[u] = *time;
+
+        let mut children = 0;
+
+        for &v in &graph[u] {
+            if !visited[v] {
+                children += 1;
+                parent[v] = Some(u);
+
+                if dfs(v, graph, visited, discovery, low, parent, time) {
+                    return true;
+                }
+
+                low[u] = low[u].min(low[v]);
+
+                if parent[u].is_none() && children > 1 {
+                    return true;
+                }
+
+                if parent[u].is_some() && low[v] >= discovery[u] {
+                    return true;
+                }
+            } else if parent[u] != Some(v) {
+                low[u] = low[u].min(discovery[v]);
+            }
+        }
+
+        false
+    }
+
+    if dfs(
+        0,
+        graph,
+        &mut visited,
+        &mut discovery,
+        &mut low,
+        &mut parent,
+        &mut time,
+    ) {
+        return true;
+    }
+
+    visited.iter().any(|&seen| !seen)
+}
+
+const VALUE_OFFSET: usize = 1;
+
+#[inline]
+fn domain_value_to_index(domain_value: i32) -> usize {
+    domain_value as usize - VALUE_OFFSET
+}
 // Tests
 
 #[cfg(test)]
@@ -160,6 +291,38 @@ mod tests {
             .expect("no conflicting atomics");
 
         let checker = CircuitChecker {
+            successors: vec!["x1", "x2", "x3", "x4"].into(),
+        };
+
+        assert!(checker.check(state, &premises, None));
+    }
+
+    fn neq(name: &'static str, value: i32) -> TestAtomic {
+        TestAtomic {
+            name,
+            comparison: pumpkin_checking::Comparison::NotEqual,
+            value,
+        }
+    }
+
+    #[test]
+    fn articulation_checker_detects_disconnected_graph() {
+        let premises = [
+            // Separate {1,2} from {3,4}
+            neq("x1", 3),
+            neq("x1", 4),
+            neq("x2", 3),
+            neq("x2", 4),
+            neq("x3", 1),
+            neq("x3", 2),
+            neq("x4", 1),
+            neq("x4", 2),
+        ];
+
+        let state = VariableState::prepare_for_conflict_check(premises, None)
+            .expect("no conflicting atomics");
+
+        let checker = CircuitArticulationChecker {
             successors: vec!["x1", "x2", "x3", "x4"].into(),
         };
 
