@@ -179,18 +179,6 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         Ok(())
     }
 
-    fn articulation_prune(&self, context: &mut PropagationContext) -> PropagationStatusCP {
-        let graph = self.build_undirected_possible_graph(context.domains());
-
-        if Self::has_articulation_point_or_is_disconnected(&graph) {
-            return Err(Conflict::Propagator(PropagatorConflict {
-                conjunction: conjunction!(),
-                inference_code: self.articulation_inference_code.clone(),
-            }));
-        }
-
-        Ok(())
-    }
 
     fn create_prevent_explanation(
         &self,
@@ -378,6 +366,92 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         }
 
         visited.iter().any(|&seen| !seen)
+    }
+
+    fn build_graph_with_forced_edge(
+        &self,
+        context: Domains,
+        forced_from: usize,
+        forced_to: usize,
+    ) -> Vec<Vec<usize>> {
+        let n = self.successors.len();
+        let mut graph = vec![Vec::new(); n];
+
+        for from in 0..n {
+            for value in 1..=n as i32 {
+                let to = domain_value_to_index(value);
+
+                if to >= n || from == to {
+                    continue;
+                }
+
+                let edge_allowed = if from == forced_from {
+                    to == forced_to
+                } else {
+                    context.contains(&self.successors[from], value)
+                };
+
+                if edge_allowed {
+                    graph[from].push(to);
+                    graph[to].push(from);
+                }
+            }
+        }
+
+        for neighbours in graph.iter_mut() {
+            neighbours.sort_unstable();
+            neighbours.dedup();
+        }
+
+        graph
+    }
+
+    fn edge_causes_articulation_or_disconnection(
+        &self,
+        context: Domains,
+        from: usize,
+        to: usize,
+    ) -> bool {
+        let graph = self.build_graph_with_forced_edge(context, from, to);
+
+        Self::has_articulation_point_or_is_disconnected(&graph)
+    }
+
+    fn articulation_prune(&self, context: &mut PropagationContext) -> PropagationStatusCP {
+        let graph = self.build_undirected_possible_graph(context.domains());
+
+        if Self::has_articulation_point_or_is_disconnected(&graph) {
+            return Err(Conflict::Propagator(PropagatorConflict {
+                conjunction: conjunction!(),
+                inference_code: self.articulation_inference_code.clone(),
+            }));
+        }
+
+        let n = self.successors.len();
+
+        for from in 0..n {
+            for value in 1..=n as i32 {
+                if !context.contains(&self.successors[from], value) {
+                    continue;
+                }
+
+                let to = domain_value_to_index(value);
+
+                if to >= n || from == to {
+                    continue;
+                }
+
+                if self.edge_causes_articulation_or_disconnection(context.domains(), from, to) {
+                    context.post(
+                        predicate!(self.successors[from] != value),
+                        conjunction!(),
+                        &self.articulation_inference_code,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -696,6 +770,42 @@ mod tests {
         assert!(
             result.is_err(),
             "A fixed lollipop structure is not a valid Hamiltonian circuit"
+        );
+    }
+
+    // ARTICULATION PRUNING SHOULD REMOVE EDGE 1 -> 4
+    #[test]
+    fn circuit_articulation_prunes_edge_that_creates_path_graph() {
+        let mut state = State::default();
+
+        let x1 = state.new_interval_variable(4, 5, None);
+        let x2 = state.new_interval_variable(1, 1, None);
+        let x3 = state.new_interval_variable(2, 2, None);
+        let x4 = state.new_interval_variable(3, 3, None);
+        let x5 = state.new_interval_variable(4, 4, None);
+
+        let constraint_tag = state.new_constraint_tag();
+
+        let _ = state.add_propagator(CircuitConstructor {
+            successors: vec![x1, x2, x3, x4, x5].into(),
+            constraint_tag,
+        });
+
+        let result = state.propagate_to_fixed_point();
+
+        assert!(
+            result.is_ok(),
+            "The instance should remain satisfiable via 1 -> 5 -> 4 -> 3 -> 2 -> 1"
+        );
+
+        assert!(
+            !state.get_domains().contains(&x1, 4),
+            "Edge 1 -> 4 should be pruned because forcing it creates a path graph"
+        );
+
+        assert!(
+            state.get_domains().contains(&x1, 5),
+            "Edge 1 -> 5 should remain because it completes the Hamiltonian cycle"
         );
     }
 }
