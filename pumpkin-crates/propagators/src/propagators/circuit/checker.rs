@@ -64,27 +64,60 @@ where
 impl<Var, Atomic> InferenceChecker<Atomic> for CircuitArticulationChecker<Var>
 where
     Var: CheckerVariable<Atomic> + 'static,
-    Atomic: AtomicConstraint,
+    Atomic: AtomicConstraint + PartialEq,
 {
     fn check(
         &self,
         state: VariableState<Atomic>,
         _premises: &[Atomic],
-        _consequent: Option<&Atomic>,
+        consequent: Option<&Atomic>,
     ) -> bool {
         let n = self.successors.len();
+
+        let forced_edge = if let Some(consequent) = consequent {
+            let mut found = None;
+
+            for (index, successor) in self.successors.iter().enumerate() {
+                for value in 1..=n as i32 {
+                    if &successor.atomic_not_equal(value) == consequent {
+                        found = Some((index, value));
+                        break;
+                    }
+                }
+
+                if found.is_some() {
+                    break;
+                }
+            }
+
+            found
+        } else {
+            None
+        };
 
         let mut graph = vec![Vec::new(); n];
 
         for from in 0..n {
             for value in 1..=n as i32 {
-                if self.successors[from].induced_domain_contains(&state, value) {
-                    let to = domain_value_to_index(value);
+                let to = domain_value_to_index(value);
 
-                    if to < n && from != to {
-                        graph[from].push(to);
-                        graph[to].push(from);
+                if to >= n || from == to {
+                    continue;
+                }
+
+                let edge_allowed = if let Some((forced_from, forced_value)) = forced_edge {
+                    if from == forced_from {
+                        value == forced_value
+                    } else {
+                        self.successors[from].induced_domain_contains(&state, value)
                     }
+                } else {
+                    self.successors[from].induced_domain_contains(&state, value)
+                };
+
+                if edge_allowed {
+                    graph[from].push(to);
+                    graph[to].push(from);
                 }
             }
         }
@@ -93,18 +126,6 @@ where
             neighbours.sort_unstable();
             neighbours.dedup();
         }
-
-        // if let Some(consequent) = consequent {
-        //     // For a pruning x != v, the checker receives the state induced by
-        //     // the premises only. To verify the pruning, we need to test whether
-        //     // assuming the opposite x = v makes the graph impossible.
-        //     //
-        //     // Easiest first version: rely on the propagated explanation being
-        //     // full-domain and check only conflict-style articulation.
-        //     //
-        //     // We will improve this once we know how to extract variable/value
-        //     // from the consequent.
-        // }
 
         has_articulation_point_or_is_disconnected(&graph)
     }
@@ -319,7 +340,7 @@ mod tests {
             neq("x4", 2),
         ];
 
-        let state = VariableState::prepare_for_conflict_check(premises, None)
+        let state = VariableState::prepare_for_conflict_check(premises.clone(), None)
             .expect("no conflicting atomics");
 
         let checker = CircuitArticulationChecker {
@@ -327,5 +348,72 @@ mod tests {
         };
 
         assert!(checker.check(state, &premises, None));
+    }
+
+    #[test]
+    fn articulation_checker_rejects_connected_non_articulation_conflict() {
+        let premises = vec![];
+
+        let state = VariableState::prepare_for_conflict_check(premises.clone(), None)
+            .expect("premises should be consistent");
+
+        let checker = CircuitArticulationChecker {
+            successors: vec!["x1", "x2", "x3", "x4"].into(),
+        };
+
+        assert!(!checker.check(state, &premises, None));
+    }
+
+    #[test]
+    fn articulation_checker_accepts_pruning_explanation() {
+        let premises = vec![
+            neq("x1", 1), neq("x1", 3), neq("x1", 4),
+
+            neq("x2", 2), neq("x2", 3), neq("x2", 4), neq("x2", 5),
+
+            neq("x3", 1), neq("x3", 3), neq("x3", 4), neq("x3", 5),
+
+            neq("x4", 1), neq("x4", 2), neq("x4", 4), neq("x4", 5),
+
+            neq("x5", 1), neq("x5", 2), neq("x5", 3), neq("x5", 5),
+        ];
+
+        let consequent = neq("x1", 2);
+
+        let state = VariableState::prepare_for_conflict_check(
+            premises.clone(),
+            Some(consequent.clone()),
+        )
+        .expect("premises and consequent should be consistent");
+
+        let checker = CircuitArticulationChecker {
+            successors: vec!["x1", "x2", "x3", "x4", "x5"].into(),
+        };
+
+        assert!(checker.check(state, &premises, Some(&consequent)));
+    }
+
+    #[test]
+    fn articulation_checker_rejects_bad_pruning_explanation() {
+        let premises = vec![
+            neq("x1", 1),
+            neq("x2", 2),
+            neq("x3", 3),
+            neq("x4", 4),
+        ];
+
+        let consequent = neq("x1", 2);
+
+        let state = VariableState::prepare_for_conflict_check(
+            premises.clone(),
+            Some(consequent.clone()),
+        )
+        .expect("premises and consequent should be consistent");
+
+        let checker = CircuitArticulationChecker {
+            successors: vec!["x1", "x2", "x3", "x4"].into(),
+        };
+
+        assert!(!checker.check(state, &premises, Some(&consequent)));
     }
 }
