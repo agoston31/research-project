@@ -145,8 +145,16 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             // Now we keep up extending our chain as long as we reach nodes that have a fixed outgoing edge.
             // We already know the upcoming node as we checked if the first node had a fixed outgoing edge;
             let mut next = domain_value_to_index(fixed_value);
+            // Set to keep track which nodes have we already visited
+            let mut seen = FixedBitSet::with_capacity(self.successors.len());
+            seen.insert(unmarked);
             // And then we keep on looping until we end up in a node with no fixed outgoing edge.
             while let Some(fixed_value_next) = context.fixed_value(&self.successors[next]) {
+                // If we arrive at a node that we have seen before we break the loop
+                if seen.contains(next) {
+                    break;
+                }
+                seen.insert(next);
                 // We add the next value to the chain
                 chain.push(next);
                 // And continue to unfold the chain from there. As the domains themselves are 1-indexed, we need to transform them to 0-indexed for our own array.
@@ -155,7 +163,10 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
 
             // We have found a chain. If the last node in the chain has a possible edge to the starting node, we prune that edge only if
             // the length of the chain is not n: if we have not visited all nodes yet we cannot return to the starting node already.
-            if context.contains(&self.successors[next], index_to_domain_value(unmarked)) && chain.len() + 1< self.successors.len() {
+            if context.fixed_value(&self.successors[next]).is_none() 
+                    && context.contains(&self.successors[next], index_to_domain_value(unmarked)) 
+                    && chain.len() + 1 < self.successors.len() 
+            {
                 let reason = self.create_prevent_explanation(context.domains(), &chain);
                 context.post(
                     predicate!(self.successors[next] != index_to_domain_value(unmarked)),
@@ -586,5 +597,105 @@ mod tests {
 
         let result = state.propagate_to_fixed_point();
         assert!(result.is_err(), "cycle doesnt end at start");
+    }
+
+    // ARTICULATION POINT POSSIBLE GRAPH (SHOULD CONFLICT)
+    #[test]
+    fn circuit_articulation_point_conflict() {
+        let mut state = State::default();
+
+        let x1 = state.new_interval_variable(2, 2, None);
+        let x2 = state.new_interval_variable(1, 4, None);
+        let x3 = state.new_interval_variable(2, 2, None);
+        let x4 = state.new_interval_variable(2, 2, None);
+
+        let constraint_tag = state.new_constraint_tag();
+
+        let _ = state.add_propagator(CircuitConstructor {
+            successors: vec![x1, x2, x3, x4].into(),
+            constraint_tag,
+        });
+
+        let result = state.propagate_to_fixed_point();
+
+        assert!(
+            result.is_err(),
+            "A possible graph with an articulation point cannot contain a Hamiltonian circuit"
+        );
+    }
+
+    // ARTICULATION SHOULD NOT REJECT A SIMPLE 4-CYCLE POSSIBLE GRAPH
+    #[test]
+    fn circuit_articulation_no_conflict_on_cycle_graph() {
+        let mut state = State::default();
+
+        let x1 = state.new_interval_variable(2, 4, None);
+        let x2 = state.new_interval_variable(1, 3, None);
+        let x3 = state.new_interval_variable(2, 4, None);
+        let x4 = state.new_interval_variable(1, 3, None);
+
+        let constraint_tag = state.new_constraint_tag();
+
+        let _ = state.add_propagator(CircuitConstructor {
+            successors: vec![x1, x2, x3, x4].into(),
+            constraint_tag,
+        });
+
+        let result = state.propagate_to_fixed_point();
+
+        assert!(
+            result.is_ok(),
+            "A biconnected possible graph should not be rejected"
+        );
+    }
+
+    // PATH-SHAPED POSSIBLE GRAPH HAS ARTICULATION POINTS
+    #[test]
+    fn circuit_articulation_path_graph_conflict() {
+        let mut state = State::default();
+
+        let x1 = state.new_interval_variable(2, 2, None);
+        let x2 = state.new_interval_variable(1, 3, None);
+        let x3 = state.new_interval_variable(2, 4, None);
+        let x4 = state.new_interval_variable(3, 3, None);
+
+        let constraint_tag = state.new_constraint_tag();
+
+        let _ = state.add_propagator(CircuitConstructor {
+            successors: vec![x1, x2, x3, x4].into(),
+            constraint_tag,
+        });
+
+        let result = state.propagate_to_fixed_point();
+
+        assert!(
+            result.is_err(),
+            "A path-shaped possible graph has articulation points"
+        );
+    }
+
+    // PREVENT SHOULD NOT LOOP ON LOLLIPOP STRUCTURE
+    #[test]
+    fn circuit_lollipop_fixed_structure_conflict() {
+        let mut state = State::default();
+
+        let x1 = state.new_interval_variable(2, 2, None);
+        let x2 = state.new_interval_variable(3, 3, None);
+        let x3 = state.new_interval_variable(4, 4, None);
+        let x4 = state.new_interval_variable(2, 2, None);
+
+        let constraint_tag = state.new_constraint_tag();
+
+        let _ = state.add_propagator(CircuitConstructor {
+            successors: vec![x1, x2, x3, x4].into(),
+            constraint_tag,
+        });
+
+        let result = state.propagate_to_fixed_point();
+
+        assert!(
+            result.is_err(),
+            "A fixed lollipop structure is not a valid Hamiltonian circuit"
+        );
     }
 }
