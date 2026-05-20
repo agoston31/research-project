@@ -168,7 +168,16 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         Ok(())
     }
 
-    fn articulation_prune(&self, _context: &mut PropagationContext) -> PropagationStatusCP {
+    fn articulation_prune(&self, context: &mut PropagationContext) -> PropagationStatusCP {
+        let graph = self.build_undirected_possible_graph(context.domains());
+
+        if Self::has_articulation_point_or_is_disconnected(&graph) {
+            return Err(Conflict::Propagator(PropagatorConflict {
+                conjunction: conjunction!(),
+                inference_code: self.articulation_inference_code.clone(),
+            }));
+        }
+
         Ok(())
     }
 
@@ -258,6 +267,106 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
                 )
             })
             .collect()
+    }
+}
+
+impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
+    // Function that builds an undirected graph based on the domains
+    // Treats every directed edge as an undirected one
+    fn build_undirected_possible_graph(&self, context: Domains) -> Vec<Vec<usize>> {
+        let n = self.successors.len();
+        let mut graph = vec![Vec::new(); n];
+
+        for from in 0..n {
+            for value in 1..=n as i32 {
+                if context.contains(&self.successors[from], value) {
+                    let to = domain_value_to_index(value);
+
+                    if to < n && from != to {
+                        graph[from].push(to);
+                        graph[to].push(from);
+                    }
+                }
+            }
+        }
+
+        for neighbours in graph.iter_mut() {
+            neighbours.sort_unstable();
+            neighbours.dedup();
+        }
+
+        graph
+    }
+
+    // Function that checks if an undirected graph is disconnected or has any articulation points
+    fn has_articulation_point_or_is_disconnected(graph: &[Vec<usize>]) -> bool {
+        let n = graph.len();
+
+        if n <= 2 {
+            return false;
+        }
+
+        let mut visited = vec![false; n];
+        let mut discovery = vec![0usize; n];
+        let mut low = vec![0usize; n];
+        let mut parent = vec![None; n];
+        let mut time = 0usize;
+
+        fn dfs(
+            u: usize,
+            graph: &[Vec<usize>],
+            visited: &mut [bool],
+            discovery: &mut [usize],
+            low: &mut [usize],
+            parent: &mut [Option<usize>],
+            time: &mut usize,
+        ) -> bool {
+            visited[u] = true;
+            *time += 1;
+            discovery[u] = *time;
+            low[u] = *time;
+
+            let mut children = 0;
+
+            for &v in &graph[u] {
+                if !visited[v] {
+                    children += 1;
+                    parent[v] = Some(u);
+
+                    if dfs(v, graph, visited, discovery, low, parent, time) {
+                        return true;
+                    }
+
+                    low[u] = low[u].min(low[v]);
+
+                    if parent[u].is_none() && children > 1 {
+                        return true;
+                    }
+
+                    if parent[u].is_some() && low[v] >= discovery[u] {
+                        return true;
+                    }
+                } else if parent[u] != Some(v) {
+                    low[u] = low[u].min(discovery[v]);
+                }
+            }
+
+            false
+        }
+
+        if dfs(
+            0,
+            graph,
+            &mut visited,
+            &mut discovery,
+            &mut low,
+            &mut parent,
+            &mut time,
+        ) {
+            return true;
+        }
+
+        visited.iter().any(|&seen| !seen)
     }
 }
 
@@ -406,7 +515,7 @@ mod tests {
         assert!(result.is_err(), "Single node with self-loop must conflict");
     }
 
-    //test two variables okey
+    //test two variables okay
     #[test]
     fn circuit_two_variable_cycle_ok() {
         let mut state = State::default();
@@ -422,5 +531,60 @@ mod tests {
 
         let result = state.propagate_to_fixed_point();
         assert!(result.is_ok(), "2-cycle is a valid Hamiltonian cycle");
+    }
+
+    // MULTIPLE DISCONNECTED COMPONENTS (SHOULD CONFLICT)
+    #[test]
+    fn circuit_articulation_multiple_components_conflict() {
+        let mut state = State::default();
+
+        // Component 1: nodes 1, 2, 3
+        let x1 = state.new_interval_variable(1, 3, None);
+        let x2 = state.new_interval_variable(1, 3, None);
+        let x3 = state.new_interval_variable(1, 3, None);
+
+        // Component 2: nodes 4, 5, 6
+        let x4 = state.new_interval_variable(4, 6, None);
+        let x5 = state.new_interval_variable(4, 6, None);
+        let x6 = state.new_interval_variable(4, 6, None);
+
+        // Component 3: nodes 7, 8, 9
+        let x7 = state.new_interval_variable(7, 9, None);
+        let x8 = state.new_interval_variable(7, 9, None);
+        let x9 = state.new_interval_variable(7, 9, None);
+
+        let constraint_tag = state.new_constraint_tag();
+
+        let _ = state.add_propagator(CircuitConstructor {
+            successors: vec![x1, x2, x3, x4, x5, x6, x7, x8, x9].into(),
+            constraint_tag,
+        });
+
+        let result = state.propagate_to_fixed_point();
+
+        assert!(
+            result.is_err(),
+            "A possible graph with multiple disconnected components cannot contain a Hamiltonian circuit"
+        );
+    }
+
+    //test subcycle length n 
+    #[test]
+    fn circuit_doesnt_end_at_start() {
+        let mut state = State::default();
+
+        let a = state.new_interval_variable(2, 2, None);
+        let b = state.new_interval_variable(3, 3, None);
+        let x = state.new_interval_variable(4, 4, None);
+        let y = state.new_interval_variable(2, 2, None);
+
+        let constraint_tag = state.new_constraint_tag();
+        let _ = state.add_propagator(CircuitConstructor {
+            successors: vec![a, b, x, y].into(),
+            constraint_tag,
+        });
+
+        let result = state.propagate_to_fixed_point();
+        assert!(result.is_err(), "cycle doesnt end at start");
     }
 }
