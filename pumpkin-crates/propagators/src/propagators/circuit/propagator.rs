@@ -111,7 +111,8 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
         self.remove_self_loops(&mut context)?;
         self.check(context.domains())?;
         self.prevent(&mut context)?;
-        self.articulation_prune(&mut context)
+        self.articulation_prune(&mut context)?;
+        self.propagate_strong_articulation_pruning(&mut context)
     }
 }
 
@@ -532,6 +533,463 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         Ok(())
     }
 
+}
+
+
+struct SccResult {
+    vertex_to_scc: Vec<usize>,
+    scc_sizes: Vec<usize>,
+    num_sccs: usize,
+}
+
+struct CondensationDag {
+    outgoing: Vec<Vec<usize>>,
+    incoming: Vec<Vec<usize>>,
+}
+
+enum StrongArticulationPruningKind {
+    OutgoingMustEnterSource,
+    IncomingMustComeFromSink,
+}
+
+impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
+    fn propagate_strong_articulation_pruning(
+        &self,
+        context: &mut PropagationContext,
+    ) -> PropagationStatusCP {
+        let n = self.successors.len();
+
+        let (_, directed_graph) = self.build_support_graph(context.domains());
+
+        let articulation_points = Self::find_strong_articulation_points(&directed_graph);
+
+        for articulation in articulation_points {
+            let scc_result = Self::compute_sccs_without_vertex(&directed_graph, articulation);
+
+            if scc_result.num_sccs <= 1 {
+                continue;
+            }
+
+            let dag = Self::build_condensation_dag(&directed_graph, articulation, &scc_result);
+
+            let source_sccs = dag.source_sccs();
+            let sink_sccs = dag.sink_sccs();
+
+            if source_sccs.len() != 1 || sink_sccs.len() != 1 {
+                let reason = self.create_dag_conflict_explanation(context.domains());
+                return Err(Conflict::Propagator(PropagatorConflict {
+                    conjunction: reason,
+                    inference_code: self.articulation_inference_code.clone(),
+                }));
+            }
+
+            let source_scc = source_sccs[0];
+            let sink_scc = sink_sccs[0];
+
+            let longest_path_weight =
+                Self::longest_weighted_path_in_dag(&dag, &scc_result.scc_sizes);
+
+            if longest_path_weight < n - 1 {
+                let reason = self.create_dag_conflict_explanation(context.domains());
+                return Err(Conflict::Propagator(PropagatorConflict {
+                    conjunction: reason,
+                    inference_code: self.articulation_inference_code.clone(),
+                }));
+            }
+
+            // Prune articulation -> non-source
+            for value in 1..=n as i32 {
+                if !context.contains(&self.successors[articulation], value) {
+                    continue;
+                }
+
+                let to = domain_value_to_index(value);
+
+                if to >= n || to == articulation {
+                    continue;
+                }
+
+                if scc_result.vertex_to_scc[to] != source_scc {
+                    let reason = self.create_edge_pruning_explanation(context.domains());
+
+                    context.post(
+                        predicate!(self.successors[articulation] != value),
+                        reason,
+                        &self.articulation_inference_code,
+                    )?;
+                }
+            }
+
+            // Prune non-sink -> articulation
+            let articulation_value = index_to_domain_value(articulation);
+
+            for from in 0..n {
+                if from == articulation {
+                    continue;
+                }
+
+                if !context.contains(&self.successors[from], articulation_value) {
+                    continue;
+                }
+
+                if scc_result.vertex_to_scc[from] != sink_scc {
+                    let reason = self.create_edge_pruning_explanation(context.domains());
+
+                    context.post(
+                        predicate!(self.successors[from] != articulation_value),
+                        reason,
+                        &self.articulation_inference_code,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn build_condensation_dag(
+        graph: &[Vec<usize>],
+        removed_vertex: usize,
+        scc_result: &SccResult,
+    ) -> CondensationDag {
+        let mut dag = CondensationDag {
+            outgoing: vec![Vec::new(); scc_result.num_sccs],
+            incoming: vec![Vec::new(); scc_result.num_sccs],
+        };
+
+        for from in 0..graph.len() {
+            if from == removed_vertex {
+                continue;
+            }
+
+            for &to in &graph[from] {
+                if to == removed_vertex {
+                    continue;
+                }
+
+                let from_scc = scc_result.vertex_to_scc[from];
+                let to_scc = scc_result.vertex_to_scc[to];
+
+                if from_scc != to_scc {
+                    dag.outgoing[from_scc].push(to_scc);
+                    dag.incoming[to_scc].push(from_scc);
+                }
+            }
+        }
+
+        dag.deduplicate_edges();
+        dag
+    }
+
+    fn longest_weighted_path_in_dag(
+        dag: &CondensationDag,
+        weights: &[usize],
+    ) -> usize {
+        let order = Self::topological_order(dag);
+        let mut dp = weights.to_vec();
+
+        for &u in &order {
+            for &v in &dag.outgoing[u] {
+                dp[v] = dp[v].max(dp[u] + weights[v]);
+            }
+        }
+
+        dp.into_iter().max().unwrap_or(0)
+    }
+
+    fn topological_order(dag: &CondensationDag) -> Vec<usize> {
+        let n = dag.outgoing.len();
+        let mut indegree = vec![0; n];
+
+        for u in 0..n {
+            for &v in &dag.outgoing[u] {
+                indegree[v] += 1;
+            }
+        }
+
+        let mut stack: Vec<usize> = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &deg)| (deg == 0).then_some(i))
+            .collect();
+
+        let mut order = Vec::new();
+
+        while let Some(u) = stack.pop() {
+            order.push(u);
+
+            for &v in &dag.outgoing[u] {
+                indegree[v] -= 1;
+                if indegree[v] == 0 {
+                    stack.push(v);
+                }
+            }
+        }
+
+        order
+    }
+
+    fn find_strong_articulation_points(graph: &[Vec<usize>]) -> Vec<usize> {
+        let n = graph.len();
+
+        if n <= 2 {
+            return Vec::new();
+        }
+
+        let original_scc_count = Self::count_sccs_without_vertex(graph, None);
+
+        let mut strong_articulation_points = Vec::new();
+
+        for removed_vertex in 0..n {
+            let scc_count_after_removal =
+                Self::count_sccs_without_vertex(graph, Some(removed_vertex));
+
+            if scc_count_after_removal > original_scc_count {
+                strong_articulation_points.push(removed_vertex);
+            }
+        }
+
+        strong_articulation_points
+    }
+
+    fn count_sccs_without_vertex(
+        graph: &[Vec<usize>],
+        removed_vertex: Option<usize>,
+    ) -> usize {
+        let n = graph.len();
+
+        let mut index = 0usize;
+        let mut stack = Vec::new();
+        let mut on_stack = vec![false; n];
+        let mut indices = vec![None; n];
+        let mut lowlink = vec![0usize; n];
+        let mut scc_count = 0usize;
+
+        fn strong_connect(
+            vertex: usize,
+            graph: &[Vec<usize>],
+            removed_vertex: Option<usize>,
+            index: &mut usize,
+            stack: &mut Vec<usize>,
+            on_stack: &mut [bool],
+            indices: &mut [Option<usize>],
+            lowlink: &mut [usize],
+            scc_count: &mut usize,
+        ) {
+            indices[vertex] = Some(*index);
+            lowlink[vertex] = *index;
+            *index += 1;
+
+            stack.push(vertex);
+            on_stack[vertex] = true;
+
+            for &successor in &graph[vertex] {
+                if Some(successor) == removed_vertex {
+                    continue;
+                }
+
+                if indices[successor].is_none() {
+                    strong_connect(
+                        successor,
+                        graph,
+                        removed_vertex,
+                        index,
+                        stack,
+                        on_stack,
+                        indices,
+                        lowlink,
+                        scc_count,
+                    );
+
+                    lowlink[vertex] = lowlink[vertex].min(lowlink[successor]);
+                } else if on_stack[successor] {
+                    lowlink[vertex] = lowlink[vertex].min(indices[successor].unwrap());
+                }
+            }
+
+            if lowlink[vertex] == indices[vertex].unwrap() {
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack[w] = false;
+
+                    if w == vertex {
+                        break;
+                    }
+                }
+
+                *scc_count += 1;
+            }
+        }
+
+        for vertex in 0..n {
+            if Some(vertex) == removed_vertex {
+                continue;
+            }
+
+            if indices[vertex].is_none() {
+                strong_connect(
+                    vertex,
+                    graph,
+                    removed_vertex,
+                    &mut index,
+                    &mut stack,
+                    &mut on_stack,
+                    &mut indices,
+                    &mut lowlink,
+                    &mut scc_count,
+                );
+            }
+        }
+
+        scc_count
+    }
+
+    fn compute_sccs_without_vertex(graph: &[Vec<usize>], removed: usize) -> SccResult {
+        let n = graph.len();
+
+        let mut index = 0usize;
+        let mut stack = Vec::new();
+        let mut on_stack = vec![false; n];
+        let mut indices = vec![None; n];
+        let mut lowlink = vec![0usize; n];
+
+        let mut vertex_to_scc = vec![usize::MAX; n];
+        let mut scc_sizes = Vec::new();
+
+        fn strong_connect(
+            vertex: usize,
+            graph: &[Vec<usize>],
+            removed: usize,
+            index: &mut usize,
+            stack: &mut Vec<usize>,
+            on_stack: &mut [bool],
+            indices: &mut [Option<usize>],
+            lowlink: &mut [usize],
+            vertex_to_scc: &mut [usize],
+            scc_sizes: &mut Vec<usize>,
+        ) {
+            indices[vertex] = Some(*index);
+            lowlink[vertex] = *index;
+            *index += 1;
+
+            stack.push(vertex);
+            on_stack[vertex] = true;
+
+            for &successor in &graph[vertex] {
+                if successor == removed {
+                    continue;
+                }
+
+                if indices[successor].is_none() {
+                    strong_connect(
+                        successor,
+                        graph,
+                        removed,
+                        index,
+                        stack,
+                        on_stack,
+                        indices,
+                        lowlink,
+                        vertex_to_scc,
+                        scc_sizes,
+                    );
+
+                    lowlink[vertex] = lowlink[vertex].min(lowlink[successor]);
+                } else if on_stack[successor] {
+                    lowlink[vertex] = lowlink[vertex].min(indices[successor].unwrap());
+                }
+            }
+
+            if lowlink[vertex] == indices[vertex].unwrap() {
+                let scc_id = scc_sizes.len();
+                let mut size = 0usize;
+
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack[w] = false;
+                    vertex_to_scc[w] = scc_id;
+                    size += 1;
+
+                    if w == vertex {
+                        break;
+                    }
+                }
+
+                scc_sizes.push(size);
+            }
+        }
+
+        for vertex in 0..n {
+            if vertex == removed {
+                continue;
+            }
+
+            if indices[vertex].is_none() {
+                strong_connect(
+                    vertex,
+                    graph,
+                    removed,
+                    &mut index,
+                    &mut stack,
+                    &mut on_stack,
+                    &mut indices,
+                    &mut lowlink,
+                    &mut vertex_to_scc,
+                    &mut scc_sizes,
+                );
+            }
+        }
+
+        SccResult {
+            num_sccs: scc_sizes.len(),
+            vertex_to_scc,
+            scc_sizes,
+        }
+    }
+
+    fn create_edge_pruning_explanation(
+        &self,
+        context: Domains,
+    ) -> PropositionalConjunction {
+        self.create_full_articulation_conflict_explanation(context)
+    }
+
+    fn create_dag_conflict_explanation(
+        &self,
+        context: Domains,
+    ) -> PropositionalConjunction {
+        self.create_full_articulation_conflict_explanation(context)
+    }
+}
+
+impl CondensationDag {
+    fn source_sccs(&self) -> Vec<usize> {
+        self.incoming
+            .iter()
+            .enumerate()
+            .filter_map(|(scc, incoming)| incoming.is_empty().then_some(scc))
+            .collect()
+    }
+
+    fn sink_sccs(&self) -> Vec<usize> {
+        self.outgoing
+            .iter()
+            .enumerate()
+            .filter_map(|(scc, outgoing)| outgoing.is_empty().then_some(scc))
+            .collect()
+    }
+
+    fn deduplicate_edges(&mut self) {
+        for edges in self.outgoing.iter_mut() {
+            edges.sort_unstable();
+            edges.dedup();
+        }
+
+        for edges in self.incoming.iter_mut() {
+            edges.sort_unstable();
+            edges.dedup();
+        }
+    }
 }
 
 
