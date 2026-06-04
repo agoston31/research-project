@@ -18,7 +18,7 @@ use pumpkin_core::state::PropagatorConflict;
 use pumpkin_core::variables::IntegerVariable;
 use pumpkin_core::propagation::InferenceCheckers;
 
-use crate::circuit::CircuitChecker;
+use crate::circuit::{CircuitChecker, CircuitArticulationChecker};
 
 
 // constructor for the propagator. ConstraintTag is for proof logging
@@ -46,6 +46,7 @@ where
 {
     type PropagatorImpl = CircuitPropagator<Var>; //associated type; specifies this constructor produces a CircuitConstructor when the solver instantiates it.
 
+    // Creates and initializes the circuit propagator
     fn create(
         self,
         mut context: pumpkin_core::propagation::PropagatorConstructorContext,
@@ -77,11 +78,18 @@ where
         }
     }
     
-    // inference checker
+    // Registers explanation checkers for all inference types produced by this propagator
     fn add_inference_checkers(&self, mut checkers: InferenceCheckers<'_>) {
         checkers.add_inference_checker(
             InferenceCode::new(self.constraint_tag, CircuitPrevent),
             Box::new(CircuitChecker {
+                successors: self.successors.clone(),
+            }),
+        );
+
+        checkers.add_inference_checker(
+            InferenceCode::new(self.constraint_tag, CircuitArticulation),
+            Box::new(CircuitArticulationChecker {
                 successors: self.successors.clone(),
             }),
         );
@@ -98,6 +106,7 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
     "Circuit"
     }
 
+    // Executes the full propagation routine
     fn propagate_from_scratch(&self, mut context: PropagationContext) -> PropagationStatusCP {
         self.remove_self_loops(&mut context)?;
         self.check(context.domains())?;
@@ -107,6 +116,9 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
 }
 
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
+    // Removes all self-loop assignments
+    // In a Hamiltonian circuit a node cannot point to itself, therefore
+    // value i is removed from the domain of variable i
     fn remove_self_loops(&self, context: &mut PropagationContext) -> PropagationStatusCP {
         for (zero_indexed_node, domain_of_one_indexed_node) in self.successors.iter().enumerate() {
             context.post(
@@ -120,6 +132,9 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
 }
 
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
+    // Prevents the formation of premature cycles
+    // Searches for chains of fixed successor assignments and removes edges
+    // that would close a cycle before all nodes have been visited
     fn prevent(&self, context: &mut PropagationContext) -> PropagationStatusCP {
         // collect all nodes that have an incoming enforced/fixed edge, these cannot be start of possible chains
         let mut has_incoming_edge = FixedBitSet::with_capacity(self.successors.len());
@@ -180,6 +195,8 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     }
 
 
+    // Creates an explanation for a prevent-subcycle pruning
+    // The reason consists of all fixed assignments forming the detected chain
     fn create_prevent_explanation(
         &self,
         context: Domains,
@@ -200,6 +217,9 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
 }    
 
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
+    // Detects already formed invalid cycles
+    // Follows all fixed successor assignments and reports a conflict whenever a cycle
+    // is encountered that is not a Hamiltonian cycle containing all nodes exactly once
     fn check(&self, context: Domains) -> PropagationStatusCP {
         let n = self.successors.len();
 
@@ -249,6 +269,8 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         Ok(())
     }
 
+    // Creates a conflict explanation for a detected subcycle
+    // The explanation contains all fixed assignments that participate in the offending cycle
     fn create_check_explanation(
         &self,
         context: Domains,
@@ -270,159 +292,212 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
 }
 
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
-    // Function that builds an undirected graph based on the domains
-    // Treats every directed edge as an undirected one
-    fn build_undirected_possible_graph(&self, context: Domains) -> Vec<Vec<usize>> {
+    // Builds two support graphs based on the domains
+    // An undirected graph
+    // And a directed one
+    fn build_support_graph(&self, context: Domains) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
         let n = self.successors.len();
-        let mut graph = vec![Vec::new(); n];
+        let mut undirected_graph = vec![Vec::new(); n];
+        let mut directed_graph = vec![Vec::new(); n];
 
         for from in 0..n {
             for value in 1..=n as i32 {
-                if context.contains(&self.successors[from], value) {
-                    let to = domain_value_to_index(value);
+                if !context.contains(&self.successors[from], value) {
+                    continue;
+                }
+                let to = domain_value_to_index(value);
+                if to >= n || from == to {
+                    continue;
+                }
+                directed_graph[from].push(to);
+            }
+        }
 
-                    if to < n && from != to {
-                        graph[from].push(to);
-                        graph[to].push(from);
-                    }
+        // Build undirected graph only from directed edges, no reverse duplication
+        for from in 0..n {
+            for &to in &directed_graph[from] {
+                undirected_graph[from].push(to);
+                // Only add reverse if the reverse directed edge does NOT already exist
+                // to avoid double-adding when both a->b and b->a are in directed graph
+                if !directed_graph[to].contains(&from) {
+                    undirected_graph[to].push(from);
                 }
             }
         }
 
-        for neighbours in graph.iter_mut() {
+        // dedup both
+        for neighbours in undirected_graph.iter_mut() {
+            neighbours.sort_unstable();
+            neighbours.dedup();
+        }
+        for neighbours in directed_graph.iter_mut() {
             neighbours.sort_unstable();
             neighbours.dedup();
         }
 
-        graph
+        (undirected_graph, directed_graph)
     }
 
-    // Function that checks if an undirected graph is disconnected or has any articulation points
-    fn has_articulation_point_or_is_disconnected(graph: &[Vec<usize>]) -> bool {
+    // Checks if an undirected graph is disconnected
+    fn is_disconnected(graph: &[Vec<usize>]) -> bool {
+        let n = graph.len();
+
+        if n <= 1 {
+            return false;
+        }
+
+        let mut visited = vec![false; n];
+        let mut stack = vec![0];
+
+        visited[0] = true;
+
+        while let Some(u) = stack.pop() {
+            for &v in &graph[u] {
+                if !visited[v] {
+                    visited[v] = true;
+                    stack.push(v);
+                }
+            }
+        }
+
+        visited.iter().any(|&seen| !seen)
+    }
+
+    // Checks whether the graph contains an articulation point
+    fn has_articulation_point(graph: &[Vec<usize>]) -> bool {
+
         let n = graph.len();
 
         if n <= 2 {
             return false;
         }
 
-        let mut visited = vec![false; n];
-        let mut discovery = vec![0usize; n];
-        let mut low = vec![0usize; n];
-        let mut parent = vec![None; n];
-        let mut time = 0usize;
+        for removed in 0..n {
+            // find a start node that isn't the removed one
+            let Some(start) = (0..n).find(|&i| i != removed) else {
+                continue;
+            };
 
-        fn dfs(
-            u: usize,
-            graph: &[Vec<usize>],
-            visited: &mut [bool],
-            discovery: &mut [usize],
-            low: &mut [usize],
-            parent: &mut [Option<usize>],
-            time: &mut usize,
-        ) -> bool {
-            visited[u] = true;
-            *time += 1;
-            discovery[u] = *time;
-            low[u] = *time;
+            let mut visited = vec![false; n];
+            visited[removed] = true; // treat removed node as already visited
 
-            let mut children = 0;
+            let mut stack = vec![start];
 
-            for &v in &graph[u] {
-                if !visited[v] {
-                    children += 1;
-                    parent[v] = Some(u);
-
-                    if dfs(v, graph, visited, discovery, low, parent, time) {
-                        return true;
-                    }
-
-                    low[u] = low[u].min(low[v]);
-
-                    if parent[u].is_none() && children > 1 {
-                        return true;
-                    }
-
-                    if parent[u].is_some() && low[v] >= discovery[u] {
-                        return true;
-                    }
-                } else if parent[u] != Some(v) {
-                    low[u] = low[u].min(discovery[v]);
-                }
-            }
-
-            false
-        }
-
-        if dfs(
-            0,
-            graph,
-            &mut visited,
-            &mut discovery,
-            &mut low,
-            &mut parent,
-            &mut time,
-        ) {
-            return true;
-        }
-
-        visited.iter().any(|&seen| !seen)
-    }
-
-    fn build_graph_with_forced_edge(
-        &self,
-        context: Domains,
-        forced_from: usize,
-        forced_to: usize,
-    ) -> Vec<Vec<usize>> {
-        let n = self.successors.len();
-        let mut graph = vec![Vec::new(); n];
-
-        for from in 0..n {
-            for value in 1..=n as i32 {
-                let to = domain_value_to_index(value);
-
-                if to >= n || from == to {
+            while let Some(u) = stack.pop() {
+                if visited[u] {
                     continue;
                 }
-
-                let edge_allowed = if from == forced_from {
-                    to == forced_to
-                } else {
-                    context.contains(&self.successors[from], value)
-                };
-
-                if edge_allowed {
-                    graph[from].push(to);
-                    graph[to].push(from);
+                visited[u] = true;
+                for &v in &graph[u] {
+                    if !visited[v] {
+                        stack.push(v);
+                    }
                 }
+            }
+
+            // if any node is still unvisited, removing `removed` disconnected the graph
+            if visited.iter().any(|&seen| !seen) {
+                return true;
             }
         }
 
-        for neighbours in graph.iter_mut() {
-            neighbours.sort_unstable();
-            neighbours.dedup();
-        }
-
-        graph
+        false
     }
 
-    fn edge_causes_articulation_or_disconnection(
+    // Constructs a graph with a candidate edge removed.
+    fn build_reduced_graph(
+        undirected_graph: &[Vec<usize>],
+        directed_graph: &[Vec<usize>],
+        from: usize,
+        to: usize,
+    ) -> Vec<Vec<usize>> {
+        let reverse_also_exists = directed_graph[to].contains(&from);
+
+        let remove_undirected_edge = !reverse_also_exists;
+
+        undirected_graph
+            .iter()
+            .enumerate()
+            .map(|(u, neighbours)| {
+                neighbours
+                    .iter()
+                    .copied()
+                    .filter(|&v| {
+                        if !remove_undirected_edge {
+                            return true;
+                        }
+
+                        !((u == from && v == to) || (u == to && v == from))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    // Creates explanation for why edge (from -> to) must be forced:
+    // all edges that are already removed from the domain are part of the reason
+    fn create_force_edge_explanation(
         &self,
         context: Domains,
         from: usize,
         to: usize,
-    ) -> bool {
-        let graph = self.build_graph_with_forced_edge(context, from, to);
+    ) -> PropositionalConjunction {
+        let n = self.successors.len();
+        let forced_value = index_to_domain_value(to);
+        let mut predicates = Vec::new();
 
-        Self::has_articulation_point_or_is_disconnected(&graph)
+        for u in 0..n {
+            for value in 1..=n as i32 {
+                let v = domain_value_to_index(value);
+                if u == from && value == forced_value {
+                    continue;
+                }
+                if v >= n || u == v {
+                    continue;
+                }
+                if !context.contains(&self.successors[u], value) {
+                    predicates.push(predicate!(self.successors[u] != value));
+                }
+            }
+        }
+
+        predicates.into_iter().collect()
     }
 
-    fn articulation_prune(&self, context: &mut PropagationContext) -> PropagationStatusCP {
-        let graph = self.build_undirected_possible_graph(context.domains());
+    // Creates a conflict explanation for articulation-based failure
+    // The explanation contains all currently removed edges
+    fn create_full_articulation_conflict_explanation(
+        &self,
+        context: Domains,
+    ) -> PropositionalConjunction {
+        let n = self.successors.len();
+        let mut predicates = Vec::new();
 
-        if Self::has_articulation_point_or_is_disconnected(&graph) {
+        for from in 0..n {
+            for value in 1..=n as i32 {
+                let to = domain_value_to_index(value);
+                if to >= n || from == to {
+                    continue;
+                }
+                if !context.contains(&self.successors[from], value) {
+                    predicates.push(predicate!(self.successors[from] != value));
+                }
+            }
+        }
+
+        predicates.into_iter().collect()
+    }
+
+    // Performs articulation-based propagation
+    // First detects global failure if the support graph is disconnected or contains an articulation point
+    // Then tests individual edges and forces those whose removal would introduce either property
+    fn articulation_prune(&self, context: &mut PropagationContext) -> PropagationStatusCP {
+        let (undirected_graph, directed_graph) = self.build_support_graph(context.domains());
+
+        if Self::is_disconnected(&undirected_graph) || Self::has_articulation_point(&undirected_graph) {
+            let reason = self.create_full_articulation_conflict_explanation(context.domains());
             return Err(Conflict::Propagator(PropagatorConflict {
-                conjunction: conjunction!(),
+                conjunction: reason,
                 inference_code: self.articulation_inference_code.clone(),
             }));
         }
@@ -430,21 +505,24 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         let n = self.successors.len();
 
         for from in 0..n {
-            for value in 1..=n as i32 {
-                if !context.contains(&self.successors[from], value) {
-                    continue;
-                }
+            if context.is_fixed(&self.successors[from]) {
+                continue;
+            }
 
-                let to = domain_value_to_index(value);
+            // If only one possible value exists, it will be caught by other propagation
+            if directed_graph[from].len() <= 1 {
+                continue;  // skip — not an articulation inference
+            }
 
-                if to >= n || from == to {
-                    continue;
-                }
+            for &to in &directed_graph[from] {
+                let value = index_to_domain_value(to);
+                let reduced = Self::build_reduced_graph(&undirected_graph, &directed_graph, from, to);
 
-                if self.edge_causes_articulation_or_disconnection(context.domains(), from, to) {
+                if Self::is_disconnected(&reduced) || Self::has_articulation_point(&reduced) {
+                    let reason = self.create_force_edge_explanation(context.domains(), from, to);
                     context.post(
-                        predicate!(self.successors[from] != value),
-                        conjunction!(),
+                        predicate!(self.successors[from] == value),
+                        reason,
                         &self.articulation_inference_code,
                     )?;
                 }
@@ -453,6 +531,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
 
         Ok(())
     }
+
 }
 
 

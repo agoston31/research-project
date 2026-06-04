@@ -19,6 +19,9 @@ where
     Var: CheckerVariable<Atomic>,
     Atomic: AtomicConstraint,
 {
+    // Validates a subcycle conflict explanation
+    // The checker follows fixed successor assignments. If these assignments form a cycle
+    // that does not include all nodes, the explanation is accepted as a valid conflict
     fn check(
         &self,
         state: VariableState<Atomic>,
@@ -65,11 +68,15 @@ impl<Var, Atomic> InferenceChecker<Atomic> for CircuitArticulationChecker<Var>
 where
     Var: CheckerVariable<Atomic> + 'static,
     Atomic: AtomicConstraint + PartialEq,
-{
+{   
+    // Validates an articulation-based conflict or pruning explanation.
+    // The premises describe removed edges. If a consequent is present, the
+    // corresponding forced edge is also temporarily removed. The explanation is valid 
+    // if the resulting support graph is disconnected or contains an articulation point
     fn check(
         &self,
-        state: VariableState<Atomic>,
-        _premises: &[Atomic],
+        _state: VariableState<Atomic>,
+        premises: &[Atomic],
         consequent: Option<&Atomic>,
     ) -> bool {
         let n = self.successors.len();
@@ -77,10 +84,11 @@ where
         let forced_edge = if let Some(consequent) = consequent {
             let mut found = None;
 
-            for (index, successor) in self.successors.iter().enumerate() {
+            for (from, successor) in self.successors.iter().enumerate() {
                 for value in 1..=n as i32 {
-                    if &successor.atomic_not_equal(value) == consequent {
-                        found = Some((index, value));
+                    if &successor.atomic_equal(value) == consequent {
+                        let to = domain_value_to_index(value);
+                        found = Some((from, to));
                         break;
                     }
                 }
@@ -95,7 +103,7 @@ where
             None
         };
 
-        let mut graph = vec![Vec::new(); n];
+        let mut directed_allowed = vec![vec![false; n]; n];
 
         for from in 0..n {
             for value in 1..=n as i32 {
@@ -105,33 +113,60 @@ where
                     continue;
                 }
 
-                let edge_allowed = if let Some((forced_from, forced_value)) = forced_edge {
-                    if from == forced_from {
-                        value == forced_value
-                    } else {
-                        self.successors[from].induced_domain_contains(&state, value)
-                    }
-                } else {
-                    self.successors[from].induced_domain_contains(&state, value)
-                };
+                let removed_by_premises = premises.iter().any(|premise| {
+                    premise == &self.successors[from].atomic_not_equal(value)
+                });
 
-                if edge_allowed {
-                    graph[from].push(to);
-                    graph[to].push(from);
+                directed_allowed[from][to] = !removed_by_premises;
+            }
+        }
+
+        if let Some((from, to)) = forced_edge {
+            directed_allowed[from][to] = false;
+        }
+
+        let mut graph = vec![Vec::new(); n];
+
+        for u in 0..n {
+            for v in (u + 1)..n {
+                if directed_allowed[u][v] || directed_allowed[v][u] {
+                    graph[u].push(v);
+                    graph[v].push(u);
                 }
             }
         }
 
-        for neighbours in graph.iter_mut() {
-            neighbours.sort_unstable();
-            neighbours.dedup();
-        }
-
-        has_articulation_point_or_is_disconnected(&graph)
+        is_disconnected(&graph) || has_articulation_point(&graph)
     }
 }
 
-fn has_articulation_point_or_is_disconnected(graph: &[Vec<usize>]) -> bool {
+// Returns whether the undirected support graph is disconnected
+fn is_disconnected(graph: &[Vec<usize>]) -> bool {
+    let n = graph.len();
+
+    if n <= 1 {
+        return false;
+    }
+
+    let mut visited = vec![false; n];
+    dfs_mark(0, graph, &mut visited);
+
+    visited.iter().any(|&seen| !seen)
+}
+
+// Marks all vertices reachable from the given start vertex using DFS
+fn dfs_mark(u: usize, graph: &[Vec<usize>], visited: &mut [bool]) {
+    visited[u] = true;
+
+    for &v in &graph[u] {
+        if !visited[v] {
+            dfs_mark(v, graph, visited);
+        }
+    }
+}
+
+// Returns whether the undirected support graph contains an articulation point
+fn has_articulation_point(graph: &[Vec<usize>]) -> bool {
     let n = graph.len();
 
     if n <= 2 {
@@ -144,61 +179,66 @@ fn has_articulation_point_or_is_disconnected(graph: &[Vec<usize>]) -> bool {
     let mut parent = vec![None; n];
     let mut time = 0usize;
 
-    fn dfs(
-        u: usize,
-        graph: &[Vec<usize>],
-        visited: &mut [bool],
-        discovery: &mut [usize],
-        low: &mut [usize],
-        parent: &mut [Option<usize>],
-        time: &mut usize,
-    ) -> bool {
-        visited[u] = true;
-        *time += 1;
-        discovery[u] = *time;
-        low[u] = *time;
-
-        let mut children = 0;
-
-        for &v in &graph[u] {
-            if !visited[v] {
-                children += 1;
-                parent[v] = Some(u);
-
-                if dfs(v, graph, visited, discovery, low, parent, time) {
-                    return true;
-                }
-
-                low[u] = low[u].min(low[v]);
-
-                if parent[u].is_none() && children > 1 {
-                    return true;
-                }
-
-                if parent[u].is_some() && low[v] >= discovery[u] {
-                    return true;
-                }
-            } else if parent[u] != Some(v) {
-                low[u] = low[u].min(discovery[v]);
-            }
+    for u in 0..n {
+        if !visited[u]
+            && articulation_dfs(
+                u,
+                graph,
+                &mut visited,
+                &mut discovery,
+                &mut low,
+                &mut parent,
+                &mut time,
+            )
+        {
+            return true;
         }
-
-        false
     }
 
-    if dfs(
-        0,
-        graph,
-        &mut visited,
-        &mut discovery,
-        &mut low,
-        &mut parent,
-        &mut time,
-    ) {
-        return true;
+    false
+}
+
+// Performs Tarjan-style DFS for articulation point detection
+fn articulation_dfs(
+    u: usize,
+    graph: &[Vec<usize>],
+    visited: &mut [bool],
+    discovery: &mut [usize],
+    low: &mut [usize],
+    parent: &mut [Option<usize>],
+    time: &mut usize,
+) -> bool {
+    visited[u] = true;
+    *time += 1;
+    discovery[u] = *time;
+    low[u] = *time;
+
+    let mut children = 0usize;
+
+    for &v in &graph[u] {
+        if !visited[v] {
+            children += 1;
+            parent[v] = Some(u);
+
+            if articulation_dfs(v, graph, visited, discovery, low, parent, time) {
+                return true;
+            }
+
+            low[u] = low[u].min(low[v]);
+
+            if parent[u].is_none() && children > 1 {
+                return true;
+            }
+
+            if parent[u].is_some() && low[v] >= discovery[u] {
+                return true;
+            }
+        } else if parent[u] != Some(v) {
+            low[u] = low[u].min(discovery[v]);
+        }
     }
 
-    visited.iter().any(|&seen| !seen)
+    false
 }
 
 const VALUE_OFFSET: usize = 1;
@@ -207,6 +247,7 @@ const VALUE_OFFSET: usize = 1;
 fn domain_value_to_index(domain_value: i32) -> usize {
     domain_value as usize - VALUE_OFFSET
 }
+
 // Tests
 
 #[cfg(test)]
@@ -378,7 +419,7 @@ mod tests {
             neq("x5", 1), neq("x5", 2), neq("x5", 3), neq("x5", 5),
         ];
 
-        let consequent = neq("x1", 2);
+        let consequent = eq("x1", 2);
 
         let state = VariableState::prepare_for_conflict_check(
             premises.clone(),
@@ -402,7 +443,7 @@ mod tests {
             neq("x4", 4),
         ];
 
-        let consequent = neq("x1", 2);
+        let consequent = eq("x1", 2);
 
         let state = VariableState::prepare_for_conflict_check(
             premises.clone(),
