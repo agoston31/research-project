@@ -18,7 +18,7 @@ use pumpkin_core::state::PropagatorConflict;
 use pumpkin_core::variables::IntegerVariable;
 use pumpkin_core::propagation::InferenceCheckers;
 
-use crate::circuit::{CircuitChecker, CircuitArticulationChecker};
+use crate::circuit::{CircuitChecker, CircuitArticulationChecker, CircuitStrongArticulationChecker};
 
 
 // constructor for the propagator. ConstraintTag is for proof logging
@@ -32,9 +32,9 @@ pub struct CircuitConstructor<Var> {
 #[derive(Debug, Clone)]
 pub struct CircuitPropagator<Var> {
     pub successors: Box<[Var]>,
-    // fields (and maybe extra ones)
     prevent_inference_code: InferenceCode,
     articulation_inference_code: InferenceCode,
+    strong_articulation_inference_code: InferenceCode,
 }
 
 // The whole propagator constructor itself
@@ -75,6 +75,7 @@ where
             successors: self.successors,
             prevent_inference_code: InferenceCode::new(self.constraint_tag, CircuitPrevent),
             articulation_inference_code: InferenceCode::new(self.constraint_tag, CircuitArticulation),
+            strong_articulation_inference_code: InferenceCode::new(self.constraint_tag, CircuitStrongArticulation),
         }
     }
     
@@ -93,11 +94,20 @@ where
                 successors: self.successors.clone(),
             }),
         );
+
+        checkers.add_inference_checker(
+            InferenceCode::new(self.constraint_tag, CircuitStrongArticulation),
+            Box::new(CircuitStrongArticulationChecker {
+                successors: self.successors.clone(),
+            }),
+        );
+
     }
 }
 
 declare_inference_label!(CircuitPrevent);
 declare_inference_label!(CircuitArticulation);
+declare_inference_label!(CircuitStrongArticulation);
 
 
 // Implementation of Propagator which has some basic functions (like defining the name) but also important functions propagate() and propagate_from_scratch()
@@ -296,7 +306,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     // Builds two support graphs based on the domains
     // An undirected graph
     // And a directed one
-    fn build_support_graph(&self, context: Domains) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    fn build_support_graph(&self, context: &Domains) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
         let n = self.successors.len();
         let mut undirected_graph = vec![Vec::new(); n];
         let mut directed_graph = vec![Vec::new(); n];
@@ -469,7 +479,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     // The explanation contains all currently removed edges
     fn create_full_articulation_conflict_explanation(
         &self,
-        context: Domains,
+        context: &Domains,
     ) -> PropositionalConjunction {
         let n = self.successors.len();
         let mut predicates = Vec::new();
@@ -493,10 +503,10 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     // First detects global failure if the support graph is disconnected or contains an articulation point
     // Then tests individual edges and forces those whose removal would introduce either property
     fn articulation_prune(&self, context: &mut PropagationContext) -> PropagationStatusCP {
-        let (undirected_graph, directed_graph) = self.build_support_graph(context.domains());
+        let (undirected_graph, directed_graph) = self.build_support_graph(&context.domains());
 
         if Self::is_disconnected(&undirected_graph) || Self::has_articulation_point(&undirected_graph) {
-            let reason = self.create_full_articulation_conflict_explanation(context.domains());
+            let reason = self.create_full_articulation_conflict_explanation(&context.domains());
             return Err(Conflict::Propagator(PropagatorConflict {
                 conjunction: reason,
                 inference_code: self.articulation_inference_code.clone(),
@@ -559,7 +569,16 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     ) -> PropagationStatusCP {
         let n = self.successors.len();
 
-        let (_, directed_graph) = self.build_support_graph(context.domains());
+        // Snapshot: build graph and capture all removed edges before any posting
+        let (directed_graph, removed_edges) = {
+            let snapshot = context.domains();
+            let (_, directed_graph) = self.build_support_graph(&snapshot);
+            
+            // Collect all removed edges as predicates right now
+            let removed_edges = self.create_full_articulation_conflict_explanation(&snapshot);
+            (directed_graph, removed_edges)
+        };
+        // snapshot borrow is dropped here; context is free again
 
         let articulation_points = Self::find_strong_articulation_points(&directed_graph);
 
@@ -571,15 +590,13 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             }
 
             let dag = Self::build_condensation_dag(&directed_graph, articulation, &scc_result);
-
             let source_sccs = dag.source_sccs();
             let sink_sccs = dag.sink_sccs();
 
             if source_sccs.len() != 1 || sink_sccs.len() != 1 {
-                let reason = self.create_dag_conflict_explanation(context.domains());
                 return Err(Conflict::Propagator(PropagatorConflict {
-                    conjunction: reason,
-                    inference_code: self.articulation_inference_code.clone(),
+                    conjunction: removed_edges,
+                    inference_code: self.strong_articulation_inference_code.clone(),
                 }));
             }
 
@@ -590,55 +607,46 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
                 Self::longest_weighted_path_in_dag(&dag, &scc_result.scc_sizes);
 
             if longest_path_weight < n - 1 {
-                let reason = self.create_dag_conflict_explanation(context.domains());
                 return Err(Conflict::Propagator(PropagatorConflict {
-                    conjunction: reason,
-                    inference_code: self.articulation_inference_code.clone(),
+                    conjunction: removed_edges,
+                    inference_code: self.strong_articulation_inference_code.clone(),
                 }));
             }
 
             // Prune articulation -> non-source
             for value in 1..=n as i32 {
-                if !context.contains(&self.successors[articulation], value) {
-                    continue;
-                }
-
                 let to = domain_value_to_index(value);
-
                 if to >= n || to == articulation {
                     continue;
                 }
-
+                // Check against directed_graph (snapshot), not live domains
+                if !directed_graph[articulation].contains(&to) {
+                    continue;
+                }
                 if scc_result.vertex_to_scc[to] != source_scc {
-                    let reason = self.create_edge_pruning_explanation(context.domains());
-
                     context.post(
                         predicate!(self.successors[articulation] != value),
-                        reason,
-                        &self.articulation_inference_code,
+                        removed_edges.clone(),
+                        &self.strong_articulation_inference_code,
                     )?;
                 }
             }
 
             // Prune non-sink -> articulation
             let articulation_value = index_to_domain_value(articulation);
-
             for from in 0..n {
                 if from == articulation {
                     continue;
                 }
-
-                if !context.contains(&self.successors[from], articulation_value) {
+                // Check against directed_graph (snapshot), not live domains
+                if !directed_graph[from].contains(&articulation) {
                     continue;
                 }
-
                 if scc_result.vertex_to_scc[from] != sink_scc {
-                    let reason = self.create_edge_pruning_explanation(context.domains());
-
                     context.post(
                         predicate!(self.successors[from] != articulation_value),
-                        reason,
-                        &self.articulation_inference_code,
+                        removed_edges.clone(),
+                        &self.strong_articulation_inference_code,
                     )?;
                 }
             }
@@ -949,14 +957,14 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
 
     fn create_edge_pruning_explanation(
         &self,
-        context: Domains,
+        context: &Domains,
     ) -> PropositionalConjunction {
         self.create_full_articulation_conflict_explanation(context)
     }
 
     fn create_dag_conflict_explanation(
         &self,
-        context: Domains,
+        context: &Domains,
     ) -> PropositionalConjunction {
         self.create_full_articulation_conflict_explanation(context)
     }

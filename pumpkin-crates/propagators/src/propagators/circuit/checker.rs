@@ -4,6 +4,10 @@ use pumpkin_checking::CheckerVariable;
 use pumpkin_checking::InferenceChecker;
 use pumpkin_checking::VariableState;
 
+use crate::circuit::circuit_graph::{
+    dag_is_infeasible, find_strong_articulation_points, compute_sccs_without_vertex, build_condensation_dag
+};
+
 #[derive(Debug, Clone)]
 pub struct CircuitChecker<Var> {
     pub successors: Box<[Var]>,
@@ -13,6 +17,12 @@ pub struct CircuitChecker<Var> {
 pub struct CircuitArticulationChecker<Var> {
     pub successors: Box<[Var]>,
 }
+
+#[derive(Debug, Clone)]
+pub struct CircuitStrongArticulationChecker<Var> {
+    pub successors: Box<[Var]>,
+}
+
 
 impl<Var, Atomic> InferenceChecker<Atomic> for CircuitChecker<Var>
 where
@@ -139,6 +149,142 @@ where
         is_disconnected(&graph) || has_articulation_point(&graph)
     }
 }
+
+impl<Var, Atomic> InferenceChecker<Atomic> for CircuitStrongArticulationChecker<Var>
+where
+    Var: CheckerVariable<Atomic> + 'static,
+    Atomic: AtomicConstraint + PartialEq,
+{
+    fn check(
+        &self,
+        _state: VariableState<Atomic>,
+        premises: &[Atomic],
+        consequent: Option<&Atomic>,
+    ) -> bool {
+        let n = self.successors.len();
+
+        let directed_graph = build_directed_support_graph(&self.successors, premises, n, None);
+        let articulation_points = find_strong_articulation_points(&directed_graph);
+
+        if let Some(consequent) = consequent {
+            // Pruning: consequent is `successors[from] != value`.
+            // Verify that there exists a strong articulation point whose SCC
+            // structure makes the pruned edge invalid.
+            let Some((from, to)) = find_pruned_edge(&self.successors, consequent, n) else {
+                return false;
+            };
+
+            for articulation in &articulation_points {
+                let scc_result = compute_sccs_without_vertex(&directed_graph, *articulation);
+
+                if scc_result.num_sccs <= 1 {
+                    continue;
+                }
+
+                let dag = build_condensation_dag(&directed_graph, *articulation, &scc_result);
+                let sources = dag.source_sccs();
+                let sinks = dag.sink_sccs();
+
+                // Only validate prunings against a well-formed DAG (one source, one sink).
+                // If the DAG itself is conflicting that is handled by the conflict branch.
+                if sources.len() != 1 || sinks.len() != 1 {
+                    continue;
+                }
+
+                let source_scc = sources[0];
+                let sink_scc = sinks[0];
+
+                // Outgoing pruning: articulation -> to, where to is not in the source SCC
+                if from == *articulation
+                    && to < n
+                    && scc_result.vertex_to_scc[to] != source_scc
+                {
+                    return true;
+                }
+
+                // Incoming pruning: from -> articulation, where from is not in the sink SCC
+                if to == *articulation
+                    && scc_result.vertex_to_scc[from] != sink_scc
+                {
+                    return true;
+                }
+            }
+
+            false
+        } else {
+            // Conflict: the current support graph is already infeasible.
+            articulation_points
+                .iter()
+                .any(|&ap| dag_is_infeasible(&directed_graph, ap, n))
+        }
+    }
+}
+
+// Builds a directed adjacency list from the premises.
+//
+// If the premises contains the atomic `successors[from] != index_to_domain_value(to)` 
+// then the (from, to) edge is removed
+// If `extra_removal` is `Some((f, t))` that edge is also excluded
+fn build_directed_support_graph<Var, Atomic>(
+    successors: &[Var],
+    premises: &[Atomic],
+    n: usize,
+    extra_removal: Option<(usize, usize)>,
+) -> Vec<Vec<usize>>
+where
+    Var: CheckerVariable<Atomic>,
+    Atomic: AtomicConstraint + PartialEq,
+{
+    let mut graph = vec![Vec::new(); n];
+ 
+    for from in 0..n {
+        for value in 1..=n as i32 {
+            let to = domain_value_to_index(value);
+ 
+            if to >= n || from == to {
+                continue;
+            }
+ 
+            if let Some((ef, et)) = extra_removal {
+                if from == ef && to == et {
+                    continue;
+                }
+            }
+ 
+            let removed = premises
+                .iter()
+                .any(|p| p == &successors[from].atomic_not_equal(value));
+ 
+            if !removed {
+                graph[from].push(to);
+            }
+        }
+    }
+ 
+    graph
+}
+
+// Parses a consequent atomic of the form `successors[from] == value` and
+// returns `(from, to)` as 0-indexed node indices, or `None` if the atomic does not match any variable.
+fn find_pruned_edge<Var, Atomic>(
+    successors: &[Var],
+    consequent: &Atomic,
+    n: usize,
+) -> Option<(usize, usize)>
+where
+    Var: CheckerVariable<Atomic>,
+    Atomic: AtomicConstraint + PartialEq,
+{
+    for (from, successor) in successors.iter().enumerate() {
+        for value in 1..=n as i32 {
+            if &successor.atomic_not_equal(value) == consequent {
+                return Some((from, domain_value_to_index(value)));
+            }
+        }
+    }
+    None
+}
+
 
 // Returns whether the undirected support graph is disconnected
 fn is_disconnected(graph: &[Vec<usize>]) -> bool {
