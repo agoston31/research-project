@@ -1,8 +1,8 @@
 {
-    "name": "Pumpkin",
-    "id": "nl.tudelft.algorithmics.pumpkin",
+    "name": "Pumpkin Circuit",
+    "id": "pumpkin-circuit",
     "version": "0.1",
-    "executable": "../target/release/pumpkin-solver",
+    "executable": "..\target\release\pumpkin-solver.exe",
     "mznlib": "./lib",
     "stdFlags": ["-v", "-f", "-r", "-t", "-s", "-a"],
 
