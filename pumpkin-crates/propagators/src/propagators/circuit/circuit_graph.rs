@@ -1,9 +1,4 @@
-//! Shared directed-graph algorithms used by both `CircuitPropagator` and
-//! `CircuitStrongArticulationChecker`.
-//!
-//! All functions operate on directed adjacency lists: `Vec<Vec<usize>>` where
-//! index `i` holds the list of nodes that `i` has an outgoing edge to.
-
+#[derive(Debug, Clone)]
 pub struct SccResult {
     // Maps each vertex to the id of its SCC (0-indexed in discovery order)
     pub vertex_to_scc: Vec<usize>,
@@ -12,6 +7,7 @@ pub struct SccResult {
     pub num_sccs: usize,
 }
 
+#[derive(Debug, Clone)]
 pub struct CondensationDag {
     pub outgoing: Vec<Vec<usize>>,
     pub incoming: Vec<Vec<usize>>,
@@ -185,7 +181,7 @@ fn tarjan_count(graph: &[Vec<usize>], removed: Option<usize>) -> usize {
             }
 
             // All neighbours of u processed
-            work_stack.pop();
+            let _ = work_stack.pop();
 
             // Propagate lowlink to parent
             if let Some(&(parent, _)) = work_stack.last() {
@@ -258,7 +254,7 @@ fn tarjan_membership(graph: &[Vec<usize>], removed: usize) -> SccResult {
                 }
             }
 
-            work_stack.pop();
+            let _ = work_stack.pop();
 
             if let Some(&(parent, _)) = work_stack.last() {
                 lowlink[parent] = lowlink[parent].min(lowlink[u]);

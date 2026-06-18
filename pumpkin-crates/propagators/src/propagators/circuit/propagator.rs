@@ -17,9 +17,21 @@ use pumpkin_core::state::PropagationStatusCP;
 use pumpkin_core::state::PropagatorConflict;
 use pumpkin_core::variables::IntegerVariable;
 use pumpkin_core::propagation::InferenceCheckers;
+use pumpkin_core::create_statistics_struct;
+use pumpkin_core::statistics::Statistic;
 
 use crate::circuit::{CircuitChecker, CircuitArticulationChecker, CircuitStrongArticulationChecker};
 
+
+// ADD STATISTIC
+create_statistics_struct!(ArticulationStatistics {
+    // Total number of articulation based conflict
+    num_strong_articulation_points: u32,
+    // Total number of articulation based edge pruning
+    num_articulation_prunings: u32,
+    // Total number of strong articulation basd conflicts
+    num_strong_articulation_conflicts: u32,
+});
 
 // constructor for the propagator. ConstraintTag is for proof logging
 #[derive(Debug, Clone)]
@@ -35,6 +47,7 @@ pub struct CircuitPropagator<Var> {
     prevent_inference_code: InferenceCode,
     articulation_inference_code: InferenceCode,
     strong_articulation_inference_code: InferenceCode,
+    statistics: ArticulationStatistics,
 }
 
 // The whole propagator constructor itself
@@ -76,6 +89,7 @@ where
             prevent_inference_code: InferenceCode::new(self.constraint_tag, CircuitPrevent),
             articulation_inference_code: InferenceCode::new(self.constraint_tag, CircuitArticulation),
             strong_articulation_inference_code: InferenceCode::new(self.constraint_tag, CircuitStrongArticulation),
+            statistics: ArticulationStatistics::default(),
         }
     }
     
@@ -121,8 +135,49 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
         self.remove_self_loops(&mut context)?;
         self.check(context.domains())?;
         self.prevent(&mut context)?;
-        self.articulation_prune(&mut context)?;
-        self.propagate_strong_articulation_pruning(&mut context)
+        self.articulation_prune(&mut context)
+
+        // Dummy variables
+        let mut num_saps = 0;
+        let mut num_prunings = 0;
+        let mut num_conflicts = 0;
+        self.propagate_strong_articulation_pruning(
+            &mut context, 
+            &mut num_saps, 
+            &mut num_prunings,
+            &mut num_conflicts,
+        )
+    }
+
+    // Copy of propagate_from_scratch
+    // With statistics
+    fn propagate(&mut self, mut context: PropagationContext) -> PropagationStatusCP {
+        self.remove_self_loops(&mut context)?;
+        self.check(context.domains())?;
+        self.prevent(&mut context)?;
+        self.articulation_prune(&mut context)
+        
+        let mut num_saps = 0;
+        let mut num_prunings = 0;
+        let mut num_conflicts = 0;
+
+        let result = self.propagate_strong_articulation_pruning(
+            &mut context,
+            &mut num_saps,
+            &mut num_prunings,
+            &mut num_conflicts,
+        );
+
+        self.statistics.num_strong_articulation_points += num_saps;
+        self.statistics.num_articulation_prunings += num_prunings;
+        self.statistics.num_strong_articulation_conflicts += num_conflicts;
+
+        result
+
+    }
+
+    fn log_statistics(&self, statistic_logger: pumpkin_core::statistics::StatisticLogger) {
+        self.statistics.log(statistic_logger);
     }
 }
 
@@ -545,27 +600,26 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
 
 }
 
-
+#[derive(Debug, Clone)]
 struct SccResult {
     vertex_to_scc: Vec<usize>,
     scc_sizes: Vec<usize>,
     num_sccs: usize,
 }
 
+#[derive(Debug, Clone)]
 struct CondensationDag {
     outgoing: Vec<Vec<usize>>,
     incoming: Vec<Vec<usize>>,
-}
-
-enum StrongArticulationPruningKind {
-    OutgoingMustEnterSource,
-    IncomingMustComeFromSink,
 }
 
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     fn propagate_strong_articulation_pruning(
         &self,
         context: &mut PropagationContext,
+        num_saps: &mut u32,
+        num_prunings: &mut u32,
+        num_conflicts: &mut u32,
     ) -> PropagationStatusCP {
         let n = self.successors.len();
 
@@ -581,6 +635,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         // snapshot borrow is dropped here; context is free again
 
         let articulation_points = Self::find_strong_articulation_points(&directed_graph);
+        *num_saps += articulation_points.len() as u32;
 
         for articulation in articulation_points {
             let scc_result = Self::compute_sccs_without_vertex(&directed_graph, articulation);
@@ -594,6 +649,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             let sink_sccs = dag.sink_sccs();
 
             if source_sccs.len() != 1 || sink_sccs.len() != 1 {
+                *num_conflicts += 1;
                 return Err(Conflict::Propagator(PropagatorConflict {
                     conjunction: removed_edges,
                     inference_code: self.strong_articulation_inference_code.clone(),
@@ -607,6 +663,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
                 Self::longest_weighted_path_in_dag(&dag, &scc_result.scc_sizes);
 
             if longest_path_weight < n - 1 {
+                *num_conflicts += 1;
                 return Err(Conflict::Propagator(PropagatorConflict {
                     conjunction: removed_edges,
                     inference_code: self.strong_articulation_inference_code.clone(),
@@ -624,6 +681,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
                     continue;
                 }
                 if scc_result.vertex_to_scc[to] != source_scc {
+                    *num_prunings += 1;
                     context.post(
                         predicate!(self.successors[articulation] != value),
                         removed_edges.clone(),
@@ -643,6 +701,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
                     continue;
                 }
                 if scc_result.vertex_to_scc[from] != sink_scc {
+                    *num_prunings += 1;
                     context.post(
                         predicate!(self.successors[from] != articulation_value),
                         removed_edges.clone(),
