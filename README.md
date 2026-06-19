@@ -1,3 +1,26 @@
+# Research Project CSE3000
+This project was done as part of the CSE3000 course of TU Delft, 2026.
+
+## Baseline vs Advanced Propagator
+
+The repository contains the final implementation used in the experiments.
+
+The advanced propagator extends the baseline implementation with:
+
+- Undirected articulation point reasoning
+- Strong articulation point reasoning
+
+To reproduce the baseline propagator used in the evaluation, disable the following calls in:
+
+pumpkin-crates/propagators/src/propagators/circuit/propagator.rs
+
+Specifically, in both `propagate_from_scratch` and `propagate`, disable these calls:
+
+- `articulation_prune(...)`
+- `propagate_strong_articulation_pruning(...)`
+
+The implementation has been intentionally left unchanged after the experimental evaluation to preserve the exact code used to generate the reported results.
+
 # Pumpkin
 
 [![Build Status](https://github.com/ConSol-Lab/pumpkin/actions/workflows/ci.yml/badge.svg)](https://github.com/ConSol-Lab/pumpkin/actions/workflows/ci.yml)
