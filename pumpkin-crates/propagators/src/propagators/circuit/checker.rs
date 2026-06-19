@@ -5,7 +5,10 @@ use pumpkin_checking::InferenceChecker;
 use pumpkin_checking::VariableState;
 
 use crate::circuit::circuit_graph::{
-    dag_is_infeasible, find_strong_articulation_points, compute_sccs_without_vertex, build_condensation_dag
+    dag_is_infeasible,
+    find_strong_articulation_points,
+    compute_sccs_without_vertex,
+    build_condensation_dag,
 };
 
 #[derive(Debug, Clone)]
@@ -264,7 +267,7 @@ where
     graph
 }
 
-// Parses a consequent atomic of the form `successors[from] == value` and
+// Parses a consequent atomic of the form `successors[from] != value` and
 // returns `(from, to)` as 0-indexed node indices, or `None` if the atomic does not match any variable.
 fn find_pruned_edge<Var, Atomic>(
     successors: &[Var],

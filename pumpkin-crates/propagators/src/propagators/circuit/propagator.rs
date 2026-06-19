@@ -25,11 +25,11 @@ use crate::circuit::{CircuitChecker, CircuitArticulationChecker, CircuitStrongAr
 
 // ADD STATISTIC
 create_statistics_struct!(ArticulationStatistics {
-    // Total number of articulation based conflict
+    // Total number of strong articulation points found
     num_strong_articulation_points: u32,
-    // Total number of articulation based edge pruning
+    // Total number of strong articulation based edge pruning
     num_articulation_prunings: u32,
-    // Total number of strong articulation basd conflicts
+    // Total number of strong articulation based conflicts
     num_strong_articulation_conflicts: u32,
 });
 
@@ -132,15 +132,20 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
 
     // Executes the full propagation routine
     fn propagate_from_scratch(&self, mut context: PropagationContext) -> PropagationStatusCP {
+        // Baseline Cycle-Prevention
         self.remove_self_loops(&mut context)?;
         self.check(context.domains())?;
         self.prevent(&mut context)?;
-        self.articulation_prune(&mut context)
+
+        // Undirected Articulation-point-based reasoning
+        self.articulation_prune(&mut context)?;
 
         // Dummy variables
         let mut num_saps = 0;
         let mut num_prunings = 0;
         let mut num_conflicts = 0;
+
+        // Strong Articulation-point-based reasoning
         self.propagate_strong_articulation_pruning(
             &mut context, 
             &mut num_saps, 
@@ -152,15 +157,20 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
     // Copy of propagate_from_scratch
     // With statistics
     fn propagate(&mut self, mut context: PropagationContext) -> PropagationStatusCP {
+        // Baseline Cycle-Prevention
         self.remove_self_loops(&mut context)?;
         self.check(context.domains())?;
         self.prevent(&mut context)?;
-        self.articulation_prune(&mut context)
         
+        // Undirected Articulation-point-based reasoning
+        self.articulation_prune(&mut context)?;
+        
+        // Statistics variables
         let mut num_saps = 0;
         let mut num_prunings = 0;
         let mut num_conflicts = 0;
 
+        // Strong Articulation-point-based reasoning
         let result = self.propagate_strong_articulation_pruning(
             &mut context,
             &mut num_saps,
@@ -1012,20 +1022,6 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             vertex_to_scc,
             scc_sizes,
         }
-    }
-
-    fn create_edge_pruning_explanation(
-        &self,
-        context: &Domains,
-    ) -> PropositionalConjunction {
-        self.create_full_articulation_conflict_explanation(context)
-    }
-
-    fn create_dag_conflict_explanation(
-        &self,
-        context: &Domains,
-    ) -> PropositionalConjunction {
-        self.create_full_articulation_conflict_explanation(context)
     }
 }
 
