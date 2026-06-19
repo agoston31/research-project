@@ -1,0 +1,36 @@
+% Generated FlatZinc statistics:
+%%%mzn-stat: paths=0
+%%%mzn-stat: flatIntVars=20
+%%%mzn-stat: flatIntConstraints=1
+%%%mzn-stat: method="satisfy"
+%%%mzn-stat: flatTime=0.175364
+%%%mzn-stat-end
+%%%mzn-stat: nodes=34
+%%%mzn-stat: restarts=0
+%%%mzn-stat: peakDepth=8
+%%%mzn-stat: solveTime=0.0010189
+%%%mzn-stat: variables=21
+%%%mzn-stat: propagators=192
+%%%mzn-stat: failures=24
+%%%mzn-stat: propagations=3717
+%%%mzn-stat: nogoods=24
+%%%mzn-stat: numAtomicConstraintsPropagated=0
+%%%mzn-stat: circuitNumber191NumStrongArticulationPoints=0
+%%%mzn-stat: circuitNumber191NumArticulationPrunings=0
+%%%mzn-stat: circuitNumber191NumStrongArticulationConflicts=0
+%%%mzn-stat: AverageConflictSize=2.625
+%%%mzn-stat: NumUnitNogoodsLearned=0
+%%%mzn-stat: AverageLearnedNogoodLength=6.166666666666667
+%%%mzn-stat: AverageBacktrackAmount=0
+%%%mzn-stat: AverageLbd=4.25
+%%%mzn-stat: 1AutonomousSearchNumBackupCalled=0
+%%%mzn-stat: 1AutonomousSearchNumPredicatesRemoved=0
+%%%mzn-stat: 1AutonomousSearchNumCalls=1
+%%%mzn-stat: 1AutonomousSearchNumPredicatesAdded=381
+%%%mzn-stat: 1AutonomousSearchAverageSizeOfHeap=381
+%%%mzn-stat: 1AutonomousSearchNumAssignedPredicatesEncountered=381
+%%%mzn-stat-end
+x = [7, 11, 4, 18, 14, 5, 17, 12, 3, 15, 13, 19, 20, 10, 1, 8, 16, 6, 2, 9];
+----------
+%%%mzn-stat: nSolutions=1
+%%%mzn-stat-end

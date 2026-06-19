@@ -1,0 +1,36 @@
+% Generated FlatZinc statistics:
+%%%mzn-stat: paths=0
+%%%mzn-stat: flatIntVars=100
+%%%mzn-stat: flatIntConstraints=1
+%%%mzn-stat: method="satisfy"
+%%%mzn-stat: flatTime=0.173056
+%%%mzn-stat-end
+%%%mzn-stat: nodes=52
+%%%mzn-stat: restarts=0
+%%%mzn-stat: peakDepth=15
+%%%mzn-stat: solveTime=0.8924573
+%%%mzn-stat: variables=101
+%%%mzn-stat: propagators=4952
+%%%mzn-stat: failures=31
+%%%mzn-stat: propagations=40427
+%%%mzn-stat: nogoods=31
+%%%mzn-stat: numAtomicConstraintsPropagated=0
+%%%mzn-stat: circuitNumber4951NumStrongArticulationPoints=9630
+%%%mzn-stat: circuitNumber4951NumArticulationPrunings=341
+%%%mzn-stat: circuitNumber4951NumStrongArticulationConflicts=16
+%%%mzn-stat: AverageConflictSize=96.96774193548387
+%%%mzn-stat: NumUnitNogoodsLearned=0
+%%%mzn-stat: AverageLearnedNogoodLength=42.54838709677419
+%%%mzn-stat: AverageBacktrackAmount=0
+%%%mzn-stat: AverageLbd=6.290322580645161
+%%%mzn-stat: 1AutonomousSearchNumBackupCalled=0
+%%%mzn-stat: 1AutonomousSearchNumPredicatesRemoved=0
+%%%mzn-stat: 1AutonomousSearchNumCalls=1
+%%%mzn-stat: 1AutonomousSearchNumPredicatesAdded=2514
+%%%mzn-stat: 1AutonomousSearchAverageSizeOfHeap=2514
+%%%mzn-stat: 1AutonomousSearchNumAssignedPredicatesEncountered=2514
+%%%mzn-stat-end
+x = [81, 73, 28, 3, 91, 1, 25, 92, 57, 40, 12, 37, 20, 38, 70, 98, 7, 52, 11, 78, 15, 30, 6, 27, 24, 16, 80, 66, 65, 48, 21, 34, 47, 19, 100, 56, 62, 82, 87, 44, 93, 63, 41, 88, 77, 22, 53, 43, 59, 61, 74, 10, 4, 42, 50, 83, 68, 36, 72, 8, 85, 13, 89, 96, 26, 67, 29, 5, 2, 60, 76, 84, 45, 23, 94, 86, 79, 99, 17, 18, 95, 69, 97, 35, 9, 75, 64, 39, 46, 32, 58, 49, 90, 54, 55, 31, 14, 51, 33, 71];
+----------
+%%%mzn-stat: nSolutions=1
+%%%mzn-stat-end
